@@ -90,6 +90,12 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <QueryDiagnosticsPanel
+      v-if="showDiagnostics"
+      :key="`diag-${meta.key}-${revision}`"
+      :revision="revision"
+    />
   </section>
 </template>
 
@@ -104,9 +110,15 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import QueryDiagnosticsPanel from '@/views/QueryDiagnosticsPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const revision = ref(1)
+// 慢查诊断同时服务于查询日志与查询构建器：前者看执行记录，后者触发冷执行/复跑。
+const showDiagnostics = computed(() =>
+  ['query_journal', 'query_builder'].includes(meta.key),
+)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')

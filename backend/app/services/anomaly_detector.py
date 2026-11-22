@@ -70,6 +70,7 @@ class AnomalyDetectorService(BaseModuleService):
             row_count=1,
             duration_ms=10.0,
             status="正常" if not is_anomaly else "异常终止",
+            completion_method="检测任务",
         )
 
         return {

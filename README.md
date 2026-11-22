@@ -79,5 +79,25 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 慢查询诊断与复跑交接
+
+查询日志和查询构建器页面底部都有「慢查询诊断与复跑」面板，对应后端
+`app/services/query_journal.py` 和 `query_builder.py`：
+
+1. **运行日志**：冷执行和缓存命中都写入运行日志，每条执行有唯一执行标识，
+   并分别记录真实指标标识（名称#指标ID）、模板标识（名称#模板ID）、实际取数口径、
+   完成方式和耗时。缓存命中按形成该结果的旧口径记账。
+2. **诊断文件**：`POST /api/cross/query-journal/diagnostics` 登记文件，
+   `GET /api/cross/query-journal/diagnostics/{file_id}/download` 下载时冻结快照。
+   明细与摘要都只取快照里已完成的执行，并用同一个慢查阈值；
+   `覆盖完成序上界` 标明文件覆盖到哪一次已完成执行，下载期间新写入的执行不进入文件。
+3. **中断与完整性**：`POST .../diagnostics/{file_id}/interrupt` 模拟生成中断；
+   半成品不能发起复跑，必须重新下载成为完整文件。
+4. **复跑**：`POST /api/cross/query/replay/{file_id}/{执行标识}` 从完整文件选一笔慢查，
+   绕过缓存、按当前生效口径冷执行，作为独立执行写入日志并关联旧执行标识；
+   旧文件保持历史口径和耗时。
+5. **核对**：`GET /api/cross/query-journal/compare?old_execution_id=&new_execution_id=`
+   并列输出新旧口径、取数方式和耗时。
+
 领域：数据工程
 子方向：数据分析与数据应用

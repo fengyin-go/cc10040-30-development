@@ -6,7 +6,10 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter
+import time
+
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse, Response
 
 from app.services.metric_definition import MetricDefinitionService
 from app.services.caliber_version import CaliberVersionService
@@ -24,6 +27,7 @@ from app.services.segment_compare import SegmentCompareService
 from app.services.anomaly_detector import AnomalyDetectorService
 from app.services.recalc_engine import RecalcEngineService
 from app.services.field_lineage import FieldLineageService
+from app.store import store
 
 router = APIRouter(prefix="/api/cross", tags=["跨模块数据流"])
 
@@ -61,10 +65,25 @@ def get_caliber_history(metric_name: str):
 
 
 @router.post("/query/{template_id}/execute")
-def execute_query(template_id: int, operator: str = "系统"):
-    """执行查询模板，返回结果与日志"""
+def execute_query(template_id: int, operator: str = "系统", use_cache: bool = True):
+    """执行查询模板，返回结果与日志。use_cache=False 时为冷执行入口。"""
     svc = QueryBuilderService()
-    return svc.execute_query(template_id, operator=operator)
+    return svc.execute_query(template_id, operator=operator, use_cache=use_cache)
+
+
+@router.post("/query/replay/{file_id}/{execution_ref}")
+def replay_query_from_diagnostic(file_id: str, execution_ref: str,
+                                 operator: str = "接班人"):
+    """从查询诊断文件选中一笔慢查，绕过缓存复跑该模板。
+
+    execution_ref 可传执行标识（exec-000123）或来源执行ID。
+    复跑结果作为独立执行写入查询日志，并关联旧文件里的执行标识。
+    """
+    svc = QueryBuilderService()
+    result = svc.replay_from_diagnostic(file_id, execution_ref, operator=operator)
+    if "error" in result:
+        return JSONResponse(status_code=400, content=result)
+    return result
 
 
 @router.post("/data-service/{api_id}/call")
@@ -103,10 +122,101 @@ def cache_stats():
 
 
 @router.get("/query-journal/slow-queries")
-def slow_queries(threshold_ms: float = 100):
-    """获取慢查询列表"""
+def slow_queries(threshold_ms: float | None = None):
+    """获取慢查询列表；不传阈值时使用与诊断文件一致的默认慢查阈值。"""
     svc = QueryJournalService()
     return svc.get_slow_queries(threshold_ms)
+
+
+@router.get("/query-journal/executions")
+def query_executions(
+    completed_only: bool = False,
+    since_execution_id: int | None = None,
+    limit: int = Query(default=200, ge=1, le=2000),
+):
+    """读取运行日志（执行维度），便于直接核对冷执行与缓存命中的记账。"""
+    logs = list(store.query_logs())
+    if completed_only:
+        logs = [log for log in logs if log.get("completed")]
+    if since_execution_id is not None:
+        logs = [log for log in logs if int(log.get("id", 0)) > since_execution_id]
+    logs.sort(key=lambda log: (int(log.get("id", 0)), int(log.get("完成序") or 0)))
+    if len(logs) > limit:
+        logs = logs[-limit:]
+    return {"items": logs, "total": len(logs)}
+
+
+# ── 慢查询诊断文件 ──
+
+@router.get("/query-journal/diagnostics")
+def list_diagnostic_files():
+    """列出诊断文件登记表：可区分完整交付与中断半成品。"""
+    svc = QueryJournalService()
+    return {"items": svc.list_diagnostic_files()}
+
+
+@router.post("/query-journal/diagnostics")
+def create_diagnostic_file(threshold_ms: float | None = None, operator: str = ""):
+    """登记一个诊断文件，准备从慢查询日志打包明细和摘要。"""
+    svc = QueryJournalService()
+    return svc.create_diagnostic_file(threshold_ms=threshold_ms, operator=operator)
+
+
+@router.get("/query-journal/diagnostics/{file_id}")
+def get_diagnostic_file(file_id: str):
+    """读取诊断文件详情；未完整交付的只返回登记信息。"""
+    svc = QueryJournalService()
+    payload = svc.get_diagnostic_file(file_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"诊断文件 {file_id} 不存在")
+    return payload
+
+
+@router.get("/query-journal/diagnostics/{file_id}/download")
+def download_diagnostic_file(file_id: str, format: str = "json"):
+    """下载诊断文件。下载开始时冻结快照，完整写出后才标记为可复跑。"""
+    svc = QueryJournalService()
+    if store.get_diagnostic_file(file_id) is None:
+        raise HTTPException(status_code=404, detail=f"诊断文件 {file_id} 不存在")
+    fmt = (format or "json").lower()
+    if fmt == "csv":
+        content = svc.render_diagnostic_csv(file_id)
+        media_type = "text/csv; charset=utf-8"
+        filename = f"{file_id}.csv"
+    else:
+        content = svc.render_diagnostic_json(file_id)
+        media_type = "application/json; charset=utf-8"
+        filename = f"{file_id}.json"
+    if content is None:
+        svc.mark_diagnostic_interrupted(file_id)
+        raise HTTPException(status_code=409, detail=f"诊断文件 {file_id} 生成失败")
+    # 先完整拿到内容再标记交付：中途异常的响应不会落到完整状态。
+    svc.mark_diagnostic_complete(file_id)
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/query-journal/diagnostics/{file_id}/interrupt")
+def interrupt_diagnostic_file(file_id: str):
+    """模拟生成中断：留下半成品，验证它不能作为复跑依据。"""
+    svc = QueryJournalService()
+    payload = svc.mark_diagnostic_interrupted(file_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"诊断文件 {file_id} 不存在")
+    return payload
+
+
+@router.get("/query-journal/compare")
+def compare_executions(old_execution_id: int, new_execution_id: int):
+    """并列核对新旧两笔执行的口径、取数方式和耗时。"""
+    svc = QueryJournalService()
+    result = svc.compare_executions(old_execution_id, new_execution_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
 
 
 @router.get("/query-journal/stats-by-metric")

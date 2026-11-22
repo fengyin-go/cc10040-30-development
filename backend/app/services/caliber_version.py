@@ -50,8 +50,8 @@ class CaliberVersionService(BaseModuleService):
         entry["pending"] = True
         entry["abnormal"] = False
 
-        # 失效相关缓存
-        cache_key_prefix = f"query:{metric_name}"
+        # 失效相关缓存（前缀带冒号，避免指标名互为前缀时误伤）
+        cache_key_prefix = f"query:{metric_name}:"
         invalidated = store.cache_invalidate_by_prefix(cache_key_prefix)
 
         return entry, f"口径版本 {entry.get('版本号')} 已生效（旧版本已过期，缓存失效 {invalidated} 条）"
